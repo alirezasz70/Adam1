@@ -1,0 +1,6 @@
+{
+  "crons": [{
+    "path": "/api/watchdog?auth=YOUR_WATCHDOG_SECRET",
+    "schedule": "*/5 * * * *"
+  }]
+}
