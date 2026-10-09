@@ -4,7 +4,7 @@ export const NODES = [
     id: "free-deno-1",
     name: "🇩🇪 Free - Deno Edge",
     type: "vless",
-    server: "your-app.deno.dev", // دامنه نود دنو که بعداً می‌سازی
+    server: "edgetunnel.a.rsadeghzadeh91.workers.dev", // دامنه نود دنو که بعداً می‌سازی
     uuid: process.env.MY_UUID, 
     tls: true,
     sni: "your-app.deno.dev",
