@@ -7,7 +7,7 @@ export const NODES = [
     server: "edgetunnel.a.rsadeghzadeh91.workers.dev", // دامنه نود دنو که بعداً می‌سازی
     uuid: process.env.MY_UUID, 
     tls: true,
-    sni: "your-app.deno.dev",
+    sni: "edgetunnel.a.rsadeghzadeh91.workers.dev",
     network: "ws",
     
     // تکنیک اختفای وب‌سایت (پث مخفی)
