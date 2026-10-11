@@ -1,194 +1,211 @@
 // =============================================================
-// ✅ ADVANCED VLESS WS WORKER (Hardened Edition)
-// Compatible with Netlify Panel Integration
+// ✅ GOLDEN STANDARD VLESS WORKER (Stable & Fast)
+// Compatible: Netlify Panel & Standard Clients
 // =============================================================
 
 export default {
   async fetch(request, env) {
-    // ---------------------------------------------------------
-    // ⚙️ تنظیمات اولیه و دریافت مقادیر از متغیرهای محیطی
-    // ---------------------------------------------------------
-    const PROXY_UUID = env.UUID || 'default-uuid-change-me'; 
-    const VLESS_PATH = '/proxy-vless'; // مسیر اتصال (باید در نتلی‌فای هم همین باشه)
-    
+    const uuid = env.UUID || 'default-uuid-change-me';
+    // مسیر پروتکل - باید دقیقاً مثل همینجا باشه
+    const pathname = "/proxy-vless"; 
+
     const url = new URL(request.url);
     
-    // 1️⃣ اختفاء صفحه اصلی: نمایش سایت جعلی برای بازرسی‌ها
+    // 1. صفحه فیک (Camouflage)
     if (url.pathname === '/') {
-      return new Response('<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Privacy Policy</title></head><body style="font-family:sans-serif;max-width:800px;margin:auto;padding:20px"><h2>Terms of Service</h2><p>Last updated: Oct 24</p><p>This page describes our terms...</p></body></html>', {
-        headers: { 'Content-Type': 'text/html; charset=utf-8' }
+      return new Response('<h1>404 Not Found</h1>', { 
+        headers: { 'Content-Type': 'text/html' } 
       });
     }
 
-    // 2️⃣ بررسی صحت مسیر درخواست
-    if (url.pathname !== VLESS_PATH) {
+    // 2. بررسی مسیر
+    if (url.pathname !== pathname) {
       return new Response('Not Found', { status: 404 });
     }
 
-    // 3️⃣ بررسی نوع درخواست (Websocket Upgrade)
-    const upgrade = request.headers.get('Upgrade');
-    if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
-      return new Response('Expected websocket upgrade', { status: 426 });
+    // 3. بررسی وب‌سوکت
+    const upgrade = request.headers.get("Upgrade");
+    if (upgrade !== "websocket") {
+      return new Response("Expected websocket upgrade", { status: 426 });
     }
 
-    // --- شروع ارتباط دو طرفه ---
-    const pair = new WebSocketPair();
-    const [client, server] = Object.values(pair);
-
-    // پذیرش ارتباط ورودی (ورکر به کاربر)
+    // 4. شروع ارتباط دوسویه
+    const [client, server] = Object.values(new WebSocketPair());
+    
+    // Accept کردن ورودی از کاربر
     server.accept();
 
-    // هندل کردن ترافیک بعد از اتصال
-    server.addEventListener('message', async (event) => {
-      try {
-        // --- 🛡️ پارسر پروتکل VLESS v0 (دقیق و حساس) ---
-        const dataBuffer = event.data instanceof ArrayBuffer ? event.data : (event.data instanceof Uint8Array ? event.data.buffer : new TextEncoder().encode(event.data).buffer);
-        const vlessData = parseVlessHeader(new Uint8Array(dataBuffer));
+    // هندل کردن اولین پیام (برای خواندن اطلاعات هدف)
+    // اگر کلاینت داده‌ای نفرستاد، صبر می‌کنیم تا زمان اتصال تمام شود
+    // اما معمولاً VLESS اولین پکت رو سریع میفرسته
+    
+    let closeFunc = () => {};
+    let ticker;
 
-        if (!vlessData || vlessData.uuid !== PROXY_UUID) {
-          console.error(`Auth Failed`);
-          server.close(1011, 'Unauthorized');
-          return;
+    // تنظیمات تایم‌اوت و قطع کردن خودکار در صورت عدم موفقیت
+    const timer = setTimeout(() => {
+        server.close(1008, "Timeout");
+    }, 15000); // 15 ثانیه وقت برای برقراری ارتباط با مقصد
+
+    // دریافت اولین فریم (که حاوی آدرس و پورت هدف VLESS هست)
+    server.addEventListener("message", async (evt) => {
+        clearTimeout(timer); // لغو تایم‌اوت
+                
+        try {
+            // جدا کردن بایت‌های هدر VLESS از داده ورودی
+            const dataBuffer = evt.data;
+            const vlessData = parseVlessHeader(dataBuffer);
+
+            // بررسی اعتبار UUID
+            if (!vlessData || vlessData.uuid !== uuid) {
+                console.error(`Auth Failed`);
+                server.close(1011, 'Unauthorized');
+                return;
+            }
+            
+            console.log(`Connecting: ${vlessData.address}:${vlessData.port}`);
+
+            // برقراری ارتباط با سرور واقعی (Outbound)
+            await connectToRealServer(server, vlessData);
+
+        } catch (err) {
+            console.error(`Error: ${err.message}`);
+            server.close(1011, err.message);
         }
-        
-        // --- 🌐 ارسال درخواست به مقصد (SNI Spoofing / Relay) ---
-        await handleTCPRequest(server, vlessData);
-
-      } catch (err) {
-        console.error(`Error handling message: ${err.message}`);
-        server.close(1011, err.message);
-      }
     });
+
+    // مدیریت بستن ارتباط توسط کاربر
+    closeFunc = () => {
+        clearTimeout(timer);
+        server.close();
+    };
+    server.addEventListener("close", closeFunc);
+    server.addEventListener("error", closeFunc);
 
     return new Response(null, { status: 101, webSocket: client });
   }
 };
 
-/**
- * تابع اصلی پردازش هدر VLESS و استخراج اطلاعات
- */
+// ---------------------------------------------------------
+// تابع استخراج آدرس و پورت از هدر استاندارد VLESS (Binary Parser)
+// ---------------------------------------------------------
 function parseVlessHeader(buffer) {
-  try {
-    if (!buffer || buffer.length < 25) throw new Error('Invalid data length');
+    try {
+        if (!buffer || buffer.length < 25) throw new Error("Invalid data");
 
-    // Version
-    if (buffer[0] !== 0) throw new Error('Not VLESS protocol');
+        // Version Check
+        if (buffer[0] !== 0) throw new Error("Not VLESS Protocol");
 
-    // UUID (Bytes 1..16)
-    const uuidBuf = buffer.slice(1, 17);
-    // تبدیل UUID برای مقایسه با متغیر محیطی
-    const uuidStr = Array.from(new Uint8Array(uuidBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        // UUID Extraction (Bytes 1-16)
+        const uuidBuf = buffer.slice(1, 17);
+        const uuidStr = Array.from(new Uint8Array(uuidBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
 
-    let offset = 17;
-    
-    // Additional Info Length
-    const addLen = buffer[offset];
-    offset += 1 + addLen;
+        let offset = 17;
+        
+        // Additional Info Length
+        const addLen = buffer[offset];
+        offset += 1 + addLen;
 
-    // Command
-    const command = buffer[offset];
-    offset += 1;
+        // Command (Should be TCP Connect)
+        // const command = buffer[offset]; offset += 1; // Usually unused for simple proxies
 
-    // Address Type
-    const addrType = buffer[offset];
-    offset += 1;
+        // Address Type
+        const addrType = buffer[offset];
+        offset += 1;
 
-    // Parsing Address & Port
-    let address = '';
-    let port = 0;
-    
-    switch (addrType) {
-      case 0x01: // IPv4
-        address = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
-        offset += 4;
-        break;
-      case 0x02: // Domain
-        const domainLen = buffer[offset];
-        address = new TextDecoder().decode(buffer.slice(offset + 1, offset + 1 + domainLen));
-        offset += 1 + domainLen;
-        break;
-      case 0x03: // IPv6
-        // خلاصه سازي كردن پارسینگ IPv6 جهت کاهش حجم و پیچیدگی (نیاز خاصی ندارد)
-        // معمولاً VPN روی موبایل IPv4 یا Domain استفاده میکند
-        throw new Error('IPv6 Not Supported in this version');
-      default:
-        throw new Error(`Unknown Address Type: ${addrType}`);
+        let address = '';
+        let port = 0;
+        
+        switch (addrType) {
+            case 0x01: // IPv4
+                address = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
+                offset += 4;
+                break;
+            case 0x02: // Domain Name
+                const domainLen = buffer[offset];
+                address = new TextDecoder().decode(buffer.slice(offset + 1, offset + 1 + domainLen));
+                offset += 1 + domainLen;
+                break;
+            case 0x03: // IPv6
+                 // تجاوز می کنیم از پارس کامل IP6 جهت ثابت ماندن کد
+                 throw new Error("IPv6 Not Supported");
+            default:
+                throw new Error(`Unknown Address Type: ${addrType}`);
+        }
+
+        // Port Reading (Big Endian)
+        port = (buffer[offset] << 8 | buffer[offset + 1]);
+        offset += 2;
+
+        return {
+            uuid: uuidStr,
+            protocol: 'tcp',
+            address: address,
+            port: port,
+            dataOffset: offset,
+            rawData: buffer // نگه داشتن بافر اصلی برای ارسال بعدی
+        };
+
+    } catch (e) {
+        console.error(e);
+        return null;
     }
-
-    // Reading Port (Big Endian)
-    port = (buffer[offset] << 8 | buffer[offset + 1]);
-    offset += 2;
-
-    return {
-      uuid: uuidStr,
-      protocol: 'tcp', // Defaulting to TCP logic for Workers
-      address: address,
-      port: port,
-      dataOffset: offset,
-      rawData: buffer // Sending full buffer allows forwarding remaining data
-    };
-
-  } catch (error) {
-    console.error(`Parse Error: ${error}`);
-    return null;
-  }
 }
 
-/**
- * مدیریت رله داده ها به مقصد (Outbound Handler)
- */
-async function handleTCPRequest(wsClient, vlessData) {
-  const { address, port, dataOffset, rawData } = vlessData;
-  
-  try {
-    // استفاده از API قدرتمند Fetch کلودفلر
-    // این روش برای 99% ترافیک وب (HTTPS/HTTP) کاربرد دارد
+// ---------------------------------------------------------
+// تابع اتصال به سرور واقعی و رله دادن دیتا (Relay)
+// ---------------------------------------------------------
+async function connectToRealServer(wsClient, vlessData) {
+    const { address, port, dataOffset, rawData } = vlessData;
     
-    // اگر پورت 443 بود، HTTPS میزنیم وگرنه HTTP
-    const isHttps = port === 443;
-    const url = new URL(`${isHttps ? 'https' : 'http'}://${address}:${port}`);
-
-    // آماده سازی هدرها (برای فریب فیلترینگ)
-    const headers = new Headers();
-    
-    // ❗️ نقطه قوت: حذف هدرهای لو رفتن هویت
-    // هدر Host مهمترین بخش برای SNI Spoofing است
-    headers.set('Host', address); 
-    
-    // بدنه درخواست (اگر داده‌ای از اول ارسال شده باشد)
-    const body = rawData.length > dataOffset ? rawData.slice(dataOffset) : undefined;
-
-    const response = await fetch(url.toString(), {
-      method: 'GET',
-      headers: headers,
-      body: body
-    });
-
-    // 🔁 بازگردانی پاسخ به کاربر (Stream piping)
-    if (response.body) {
-      const reader = response.body.getReader();
-      
-      while (true) {
-        const { done, value } = await reader.read();
+    try {
+        // استفاده از قدرت Fetch API کلودفلر
+        // این روش برای ۹۹٪ ترافیک وب (HTTPS) بهترین کارایی رو دارد
         
-        if (done) break;
+        // تعیین پروتکل بر اساس پورت
+        const scheme = port === 443 ? 'https' : 'http';
+        const url = `${scheme}://${address}:${port}`;
         
-        if (wsClient.readyState === wsClient.OPEN) {
-          // ارسال داده های دریافتی به کلاینت
-          wsClient.send(value);
+        // آماده‌سازی هدرهای خروجی
+        const headers = new Headers();
+        
+        // مهم: تنظیم صحیح هدر Host
+        headers.set('Host', address);
+        
+        // اگر داده‌ای باقی مونده از اولین پکت (بعد از هدر) وجود داشت
+        // آن را به عنوان بدنه درخواست می‌فرستیم
+        let body = rawData.length > dataOffset ? rawData.slice(dataOffset) : undefined;
+
+        // ارسال درخواست به سرور واقعی
+        const resp = await fetch(url.toString(), {
+            method: 'GET',
+            headers: headers,
+            body: body
+        });
+
+        // --- دریافت پاسخ و برگرداندن به کاربر ---
+        if (resp.body) {
+            const reader = resp.body.getReader();
+            
+            while (true) {
+                const { done, value } = await reader.read();
+                
+                if (done) break;
+                
+                if (wsClient.readyState === wsClient.OPEN) {
+                    wsClient.send(value);
+                } else {
+                    break;
+                }
+            }
         } else {
-          break; // اتصال کاربر قطع شد
+             wsClient.send(new TextEncoder().encode("HTTP 200 OK\r\n"));
         }
-      }
-    } else {
-      // اگر بدنه ای نبود
-      wsClient.send(new TextEncoder().encode("HTTP 200 OK\r\n"));
-    }
 
-  } catch (error) {
-    console.error(`Fetch Error: ${error.message}`);
-    if (wsClient.readyState === wsClient.OPEN) {
-      wsClient.close(1011, `Connection Failed: ${error.message}`);
+    } catch (error) {
+        console.error(`Connection Error: ${error.message}`);
+        if (wsClient.readyState === wsClient.OPEN) {
+            wsClient.close(1011, `Error: ${error.message}`);
+        }
     }
-  }
 }
