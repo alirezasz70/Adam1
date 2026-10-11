@@ -11,7 +11,7 @@ export const NODES = [
     network: "ws",
     
     // تکنیک اختفای وب‌سایت (پث مخفی)
-    path: "/my-secret-path-12345", 
+    path: "/proxy-vless", 
     
     // آرایه پورت‌ها
     ports: [443, 8443, 2053, 2083], 
