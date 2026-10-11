@@ -1,113 +1,94 @@
 // =============================================================
-// ✅ GOLDEN STANDARD VLESS WORKER (Stable & Fast)
-// Compatible: Netlify Panel & Standard Clients
+// ✅ FINAL STABLE VLESS WORKER (Optimized for Browsing)
 // =============================================================
 
 export default {
   async fetch(request, env) {
-    const uuid = env.UUID || 'default-uuid-change-me';
-    // مسیر پروتکل - باید دقیقاً مثل همینجا باشه
-    const pathname = "/proxy-vless"; 
-
-    const url = new URL(request.url);
+    // دریافت تنظیمات از متغیرهای محیطی
+    const PROXY_UUID = env.UUID; 
+    const VLESS_PATH = '/proxy-vless'; // مسیر اتصال
     
-    // 1. صفحه فیک (Camouflage)
+    const url = new URL(request.url);
+
+    // 1. اختفاء: نمایش صفحه ساختگی برای بازرسی ربات‌ها
     if (url.pathname === '/') {
-      return new Response('<h1>404 Not Found</h1>', { 
-        headers: { 'Content-Type': 'text/html' } 
-      });
+      return new Response('<h1>404 Not Found</h1>', { headers: { 'Content-Type': 'text/html' } });
     }
 
-    // 2. بررسی مسیر
-    if (url.pathname !== pathname) {
+    // 2. بررسی مسیر درخواست
+    if (url.pathname !== VLESS_PATH) {
       return new Response('Not Found', { status: 404 });
     }
 
-    // 3. بررسی وب‌سوکت
-    const upgrade = request.headers.get("Upgrade");
-    if (upgrade !== "websocket") {
-      return new Response("Expected websocket upgrade", { status: 426 });
+    // 3. بررسی نوع اتصال (باید وب‌سوکت باشد)
+    const upgrade = request.headers.get('Upgrade');
+    if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
+      return new Response('Expected websocket upgrade', { status: 426 });
     }
 
-    // 4. شروع ارتباط دوسویه
+    // --- شروع پروتکل ---
     const [client, server] = Object.values(new WebSocketPair());
     
-    // Accept کردن ورودی از کاربر
     server.accept();
 
-    // هندل کردن اولین پیام (برای خواندن اطلاعات هدف)
-    // اگر کلاینت داده‌ای نفرستاد، صبر می‌کنیم تا زمان اتصال تمام شود
-    // اما معمولاً VLESS اولین پکت رو سریع میفرسته
-    
-    let closeFunc = () => {};
-    let ticker;
+    // دریافت اولین پیام کاربر برای خواندن آدرس هدف
+    // ما از یک Promise استفاده میکنیم تا صبر کنیم اولین دیتا بیاد
+    const {
+        value: firstMsg,
+        done
+    } = await server.messageIterator().next();
 
-    // تنظیمات تایم‌اوت و قطع کردن خودکار در صورت عدم موفقیت
-    const timer = setTimeout(() => {
-        server.close(1008, "Timeout");
-    }, 15000); // 15 ثانیه وقت برای برقراری ارتباط با مقصد
-
-    // دریافت اولین فریم (که حاوی آدرس و پورت هدف VLESS هست)
-    server.addEventListener("message", async (evt) => {
-        clearTimeout(timer); // لغو تایم‌اوت
-                
+    if (!done && firstMsg) {
         try {
-            // جدا کردن بایت‌های هدر VLESS از داده ورودی
-            const dataBuffer = evt.data;
-            const vlessData = parseVlessHeader(dataBuffer);
+            // پرداز هدر VLESS
+            const vlessInfo = parseVLESS(firstMsg.data);
 
-            // بررسی اعتبار UUID
-            if (!vlessData || vlessData.uuid !== uuid) {
+            // چک کردن رمز عبور (UUID)
+            if (!vlessInfo || vlessInfo.uuid !== PROXY_UUID) {
                 console.error(`Auth Failed`);
                 server.close(1011, 'Unauthorized');
-                return;
+                return new Response(null, { status: 101, webSocket: client });
             }
             
-            console.log(`Connecting: ${vlessData.address}:${vlessData.port}`);
+            console.log(`Target: ${vlessInfo.address}:${vlessInfo.port}`);
 
-            // برقراری ارتباط با سرور واقعی (Outbound)
-            await connectToRealServer(server, vlessData);
+            // تلاش برای اتصال به مقصد و ارسال دیتا
+            await handleUpstream(server, vlessInfo);
 
         } catch (err) {
             console.error(`Error: ${err.message}`);
             server.close(1011, err.message);
         }
-    });
-
-    // مدیریت بستن ارتباط توسط کاربر
-    closeFunc = () => {
-        clearTimeout(timer);
+    } else {
         server.close();
-    };
-    server.addEventListener("close", closeFunc);
-    server.addEventListener("error", closeFunc);
+    }
 
     return new Response(null, { status: 101, webSocket: client });
   }
 };
 
-// ---------------------------------------------------------
-// تابع استخراج آدرس و پورت از هدر استاندارد VLESS (Binary Parser)
-// ---------------------------------------------------------
-function parseVlessHeader(buffer) {
+/**
+ * استخراج اطلاعات آدرس و پورت از فرمت باینری VLESS
+ */
+function parseVLESS(buffer) {
     try {
-        if (!buffer || buffer.length < 25) throw new Error("Invalid data");
+        if (!buffer || buffer.length < 26) throw new Error("Invalid VLESS");
+        
+        // Byte 0: Version (must be 0)
+        if (buffer[0] !== 0) throw new Error("Invalid Version");
 
-        // Version Check
-        if (buffer[0] !== 0) throw new Error("Not VLESS Protocol");
-
-        // UUID Extraction (Bytes 1-16)
-        const uuidBuf = buffer.slice(1, 17);
-        const uuidStr = Array.from(new Uint8Array(uuidBuf)).map(b => b.toString(16).padStart(2, '0')).join('');
+        // Bytes 1-16: UUID
+        const uuidArr = buffer.slice(1, 17);
+        const uuidStr = Array.from(new Uint8Array(uuidArr)).map(b => b.toString(16).padStart(2, '0')).join('');
 
         let offset = 17;
         
-        // Additional Info Length
+        // Additional Info Length & Skip
         const addLen = buffer[offset];
         offset += 1 + addLen;
 
-        // Command (Should be TCP Connect)
-        // const command = buffer[offset]; offset += 1; // Usually unused for simple proxies
+        // Command (TCP Connect)
+        // const command = buffer[offset]; offset += 1;
 
         // Address Type
         const addrType = buffer[offset];
@@ -116,96 +97,88 @@ function parseVlessHeader(buffer) {
         let address = '';
         let port = 0;
         
+        // Parsing Address based on type
         switch (addrType) {
             case 0x01: // IPv4
                 address = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
                 offset += 4;
                 break;
-            case 0x02: // Domain Name
+            case 0x02: // Domain
                 const domainLen = buffer[offset];
                 address = new TextDecoder().decode(buffer.slice(offset + 1, offset + 1 + domainLen));
                 offset += 1 + domainLen;
                 break;
-            case 0x03: // IPv6
-                 // تجاوز می کنیم از پارس کامل IP6 جهت ثابت ماندن کد
+            case 0x03: // IPv6 (Not supported simply here)
                  throw new Error("IPv6 Not Supported");
             default:
-                throw new Error(`Unknown Address Type: ${addrType}`);
+                throw new Error(`Unknown AddrType: ${addrType}`);
         }
 
-        // Port Reading (Big Endian)
+        // Port (Big Endian)
         port = (buffer[offset] << 8 | buffer[offset + 1]);
         offset += 2;
 
         return {
             uuid: uuidStr,
-            protocol: 'tcp',
             address: address,
             port: port,
             dataOffset: offset,
-            rawData: buffer // نگه داشتن بافر اصلی برای ارسال بعدی
+            rawData: buffer
         };
-
     } catch (e) {
-        console.error(e);
         return null;
     }
 }
 
-// ---------------------------------------------------------
-// تابع اتصال به سرور واقعی و رله دادن دیتا (Relay)
-// ---------------------------------------------------------
-async function connectToRealServer(wsClient, vlessData) {
-    const { address, port, dataOffset, rawData } = vlessData;
+/**
+ * مدیریت ارتباط با سرور واقعی و رله داده‌ها
+ * از Fetch API کلودفلر برای برقراری ارتباط HTTPS خروجی استفاده میکند
+ */
+async function handleUpstream(wsClient, vlessInfo) {
+    const { address, port, dataOffset, rawData } = vlessInfo;
     
     try {
-        // استفاده از قدرت Fetch API کلودفلر
-        // این روش برای ۹۹٪ ترافیک وب (HTTPS) بهترین کارایی رو دارد
-        
         // تعیین پروتکل بر اساس پورت
         const scheme = port === 443 ? 'https' : 'http';
         const url = `${scheme}://${address}:${port}`;
-        
-        // آماده‌سازی هدرهای خروجی
-        const headers = new Headers();
-        
-        // مهم: تنظیم صحیح هدر Host
-        headers.set('Host', address);
-        
-        // اگر داده‌ای باقی مونده از اولین پکت (بعد از هدر) وجود داشت
-        // آن را به عنوان بدنه درخواست می‌فرستیم
-        let body = rawData.length > dataOffset ? rawData.slice(dataOffset) : undefined;
 
-        // ارسال درخواست به سرور واقعی
-        const resp = await fetch(url.toString(), {
+        // آماده سازی بدنه درخواست (داده های اضافه بعد از هدر)
+        let body = rawData.byteLength > dataOffset ? rawData.slice(dataOffset) : undefined;
+
+        // ارسال درخواست به مقصد
+        const response = await fetch(url, {
             method: 'GET',
-            headers: headers,
+            headers: {
+                'Host': address // مهم برای SNI
+            },
             body: body
         });
 
-        // --- دریافت پاسخ و برگرداندن به کاربر ---
-        if (resp.body) {
-            const reader = resp.body.getReader();
+        // اگر پاسخی برگشت، آن را به سمت کاربر برگردان
+        if (response.body) {
+            const reader = response.body.getReader();
             
             while (true) {
                 const { done, value } = await reader.read();
                 
                 if (done) break;
                 
+                // ارسال دیتای دریافتی به کاربر
                 if (wsClient.readyState === wsClient.OPEN) {
                     wsClient.send(value);
                 } else {
-                    break;
+                    break; // کاربر قطع کرده
                 }
             }
-        } else {
-             wsClient.send(new TextEncoder().encode("HTTP 200 OK\r\n"));
         }
+        
+        // بستن آرام connection پس از تمام شدن
+        if (wsClient.readyState === wsClient.OPEN) wsClient.close();
 
     } catch (error) {
-        console.error(`Connection Error: ${error.message}`);
+        console.error(`Upstream Error: ${error}`);
         if (wsClient.readyState === wsClient.OPEN) {
-            wsClient.close(1011, `Error: ${error.message}`);
+            wsClient.close(1011, error.message);
         }
     }
 }
