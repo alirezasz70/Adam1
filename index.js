@@ -1,184 +1,272 @@
-// =============================================================
-// ✅ FINAL STABLE VLESS WORKER (Optimized for Browsing)
-// =============================================================
 
-export default {
-  async fetch(request, env) {
-    // دریافت تنظیمات از متغیرهای محیطی
-    const PROXY_UUID = env.UUID; 
-    const VLESS_PATH = '/proxy-vless'; // مسیر اتصال
-    
-    const url = new URL(request.url);
+import http from "node:http";
+import net from "node:net";
+import { WebSocketServer, WebSocket } from "ws";
 
-    // 1. اختفاء: نمایش صفحه ساختگی برای بازرسی ربات‌ها
-    if (url.pathname === '/') {
-      return new Response('<h1>404 Not Found</h1>', { headers: { 'Content-Type': 'text/html' } });
-    }
+const PORT = Number(process.env.PORT || 3000);
+const VLESS_PATH = "/proxy-vless";
 
-    // 2. بررسی مسیر درخواست
-    if (url.pathname !== VLESS_PATH) {
-      return new Response('Not Found', { status: 404 });
-    }
-
-    // 3. بررسی نوع اتصال (باید وب‌سوکت باشد)
-    const upgrade = request.headers.get('Upgrade');
-    if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
-      return new Response('Expected websocket upgrade', { status: 426 });
-    }
-
-    // --- شروع پروتکل ---
-    const [client, server] = Object.values(new WebSocketPair());
-    
-    server.accept();
-
-    // دریافت اولین پیام کاربر برای خواندن آدرس هدف
-    // ما از یک Promise استفاده میکنیم تا صبر کنیم اولین دیتا بیاد
-    const {
-        value: firstMsg,
-        done
-    } = await server.messageIterator().next();
-
-    if (!done && firstMsg) {
-        try {
-            // پرداز هدر VLESS
-            const vlessInfo = parseVLESS(firstMsg.data);
-
-            // چک کردن رمز عبور (UUID)
-            if (!vlessInfo || vlessInfo.uuid !== PROXY_UUID) {
-                console.error(`Auth Failed`);
-                server.close(1011, 'Unauthorized');
-                return new Response(null, { status: 101, webSocket: client });
-            }
-            
-            console.log(`Target: ${vlessInfo.address}:${vlessInfo.port}`);
-
-            // تلاش برای اتصال به مقصد و ارسال دیتا
-            await handleUpstream(server, vlessInfo);
-
-        } catch (err) {
-            console.error(`Error: ${err.message}`);
-            server.close(1011, err.message);
-        }
-    } else {
-        server.close();
-    }
-
-    return new Response(null, { status: 101, webSocket: client });
+const server = http.createServer((req, res) => {
+  if (req.url === "/") {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end("Adam is running");
+    return;
   }
-};
 
-/**
- * استخراج اطلاعات آدرس و پورت از فرمت باینری VLESS
- */
-function parseVLESS(buffer) {
-    try {
-        if (!buffer || buffer.length < 26) throw new Error("Invalid VLESS");
-        
-        // Byte 0: Version (must be 0)
-        if (buffer[0] !== 0) throw new Error("Invalid Version");
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("Not Found");
+});
 
-        // Bytes 1-16: UUID
-        const uuidArr = buffer.slice(1, 17);
-        const uuidStr = Array.from(new Uint8Array(uuidArr)).map(b => b.toString(16).padStart(2, '0')).join('');
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: 1024 * 1024
+});
 
-        let offset = 17;
-        
-        // Additional Info Length & Skip
-        const addLen = buffer[offset];
-        offset += 1 + addLen;
+server.on("upgrade", (req, socket, head) => {
+  let pathname;
 
-        // Command (TCP Connect)
-        // const command = buffer[offset]; offset += 1;
+  try {
+    pathname = new URL(req.url, "http://localhost").pathname;
+  } catch {
+    socket.destroy();
+    return;
+  }
 
-        // Address Type
-        const addrType = buffer[offset];
-        offset += 1;
+  if (pathname !== VLESS_PATH) {
+    socket.destroy();
+    return;
+  }
 
-        let address = '';
-        let port = 0;
-        
-        // Parsing Address based on type
-        switch (addrType) {
-            case 0x01: // IPv4
-                address = `${buffer[offset]}.${buffer[offset+1]}.${buffer[offset+2]}.${buffer[offset+3]}`;
-                offset += 4;
-                break;
-            case 0x02: // Domain
-                const domainLen = buffer[offset];
-                address = new TextDecoder().decode(buffer.slice(offset + 1, offset + 1 + domainLen));
-                offset += 1 + domainLen;
-                break;
-            case 0x03: // IPv6 (Not supported simply here)
-                 throw new Error("IPv6 Not Supported");
-            default:
-                throw new Error(`Unknown AddrType: ${addrType}`);
-        }
+  wss.handleUpgrade(req, socket, head, (ws) => {
+    wss.emit("connection", ws, req);
+  });
+});
 
-        // Port (Big Endian)
-        port = (buffer[offset] << 8 | buffer[offset + 1]);
-        offset += 2;
+function parseVlessHeader(data) {
+  if (data.length < 18) {
+    throw new Error("Incomplete VLESS header");
+  }
 
-        return {
-            uuid: uuidStr,
-            address: address,
-            port: port,
-            dataOffset: offset,
-            rawData: buffer
-        };
-    } catch (e) {
-        return null;
+  const version = data[0];
+  const uuid = data.subarray(1, 17);
+  const addonLength = data[17];
+
+  let offset = 18;
+
+  if (data.length < offset + addonLength + 4) {
+    throw new Error("Incomplete VLESS request");
+  }
+
+  offset += addonLength;
+
+  const command = data[offset++];
+
+  if (command !== 1) {
+    throw new Error("Only TCP is supported");
+  }
+
+  const port = data.readUInt16BE(offset);
+  offset += 2;
+
+  const addressType = data[offset++];
+  let address;
+
+  if (addressType === 1) {
+    if (data.length < offset + 4) {
+      throw new Error("Incomplete IPv4 address");
     }
+
+    address = Array.from(data.subarray(offset, offset + 4)).join(".");
+    offset += 4;
+  } else if (addressType === 2) {
+    if (data.length < offset + 1) {
+      throw new Error("Missing domain length");
+    }
+
+    const length = data[offset++];
+
+    if (length === 0 || data.length < offset + length) {
+      throw new Error("Invalid domain address");
+    }
+
+    address = data.subarray(offset, offset + length).toString("utf8");
+    offset += length;
+
+    if (!address || /[\s/\\]/.test(address)) {
+      throw new Error("Invalid domain");
+    }
+  } else if (addressType === 3) {
+    if (data.length < offset + 16) {
+      throw new Error("Incomplete IPv6 address");
+    }
+
+    const parts = [];
+
+    for (let i = 0; i < 16; i += 2) {
+      parts.push(data.readUInt16BE(offset + i).toString(16));
+    }
+
+    address = parts.join(":");
+    offset += 16;
+  } else {
+    throw new Error("Unknown address type");
+  }
+
+  if (port < 1 || port > 65535) {
+    throw new Error("Invalid destination port");
+  }
+
+  return {
+    version,
+    uuid,
+    address,
+    port,
+    payload: data.subarray(offset)
+  };
 }
 
-/**
- * مدیریت ارتباط با سرور واقعی و رله داده‌ها
- * از Fetch API کلودفلر برای برقراری ارتباط HTTPS خروجی استفاده میکند
- */
-async function handleUpstream(wsClient, vlessInfo) {
-    const { address, port, dataOffset, rawData } = vlessInfo;
-    
+wss.on("connection", (ws) => {
+  let tcp = null;
+  let initialized = false;
+  let connected = false;
+  let pending = [];
+
+  function closeWebSocket(code, reason) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.close(code, reason);
+    } else if (ws.readyState === WebSocket.CONNECTING) {
+      ws.terminate();
+    }
+  }
+
+  function cleanup() {
+    pending = [];
+
+    if (tcp && !tcp.destroyed) {
+      tcp.destroy();
+    }
+  }
+
+  ws.on("message", (message, isBinary) => {
+    if (!isBinary) {
+      closeWebSocket(1003, "Binary data required");
+      return;
+    }
+
+    const data = Buffer.isBuffer(message)
+      ? message
+      : Buffer.from(message);
+
+    if (initialized) {
+      if (connected && tcp && !tcp.destroyed) {
+        tcp.write(data);
+      } else {
+        pending.push(data);
+      }
+      return;
+    }
+
     try {
-        // تعیین پروتکل بر اساس پورت
-        const scheme = port === 443 ? 'https' : 'http';
-        const url = `${scheme}://${address}:${port}`;
+      const uuidText = String(process.env.UUID || "")
+        .replace(/-/g, "")
+        .toLowerCase();
 
-        // آماده سازی بدنه درخواست (داده های اضافه بعد از هدر)
-        let body = rawData.byteLength > dataOffset ? rawData.slice(dataOffset) : undefined;
+      if (!/^[0-9a-f]{32}$/.test(uuidText)) {
+        console.error("UUID environment variable is missing or invalid");
+        closeWebSocket(1011, "Server configuration error");
+        return;
+      }
 
-        // ارسال درخواست به مقصد
-        const response = await fetch(url, {
-            method: 'GET',
-            headers: {
-                'Host': address // مهم برای SNI
-            },
-            body: body
-        });
+      const request = parseVlessHeader(data);
+      const expectedUUID = Buffer.from(uuidText, "hex");
 
-        // اگر پاسخی برگشت، آن را به سمت کاربر برگردان
-        if (response.body) {
-            const reader = response.body.getReader();
-            
-            while (true) {
-                const { done, value } = await reader.read();
-                
-                if (done) break;
-                
-                // ارسال دیتای دریافتی به کاربر
-                if (wsClient.readyState === wsClient.OPEN) {
-                    wsClient.send(value);
-                } else {
-                    break; // کاربر قطع کرده
-                }
+      if (!request.uuid.equals(expectedUUID)) {
+        closeWebSocket(1008, "Unauthorized");
+        return;
+      }
+
+      initialized = true;
+
+      if (request.payload.length > 0) {
+        pending.push(request.payload);
+      }
+
+      tcp = net.createConnection({
+        host: request.address,
+        port: request.port
+      });
+
+      tcp.setTimeout(120000);
+
+      tcp.on("connect", () => {
+        if (ws.readyState !== WebSocket.OPEN) {
+          tcp.destroy();
+          return;
+        }
+
+        connected = true;
+
+        ws.send(
+          Buffer.from([request.version, 0]),
+          { binary: true },
+          (error) => {
+            if (error) {
+              cleanup();
+              closeWebSocket(1011, "WebSocket send failed");
             }
-        }
-        
-        // بستن آرام connection پس از تمام شدن
-        if (wsClient.readyState === wsClient.OPEN) wsClient.close();
+          }
+        );
 
-    } catch (error) {
-        console.error(`Upstream Error: ${error}`);
-        if (wsClient.readyState === wsClient.OPEN) {
-            wsClient.close(1011, error.message);
+        for (const chunk of pending) {
+          if (tcp.destroyed) break;
+          tcp.write(chunk);
         }
+
+        pending = [];
+      });
+
+      tcp.on("data", (chunk) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(chunk, { binary: true }, (error) => {
+            if (error) cleanup();
+          });
+        }
+      });
+
+      tcp.on("timeout", () => {
+        tcp.destroy(new Error("TCP connection timed out"));
+      });
+
+      tcp.on("end", () => {
+        closeWebSocket(1000, "Destination closed");
+      });
+
+      tcp.on("error", (error) => {
+        console.error("TCP upstream error:", error.message);
+        closeWebSocket(1011, "Upstream connection failed");
+      });
+
+      tcp.on("close", () => {
+        connected = false;
+
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.close();
+        }
+      });
+    } catch (error) {
+      console.error("VLESS request error:", error.message);
+      closeWebSocket(1002, "Invalid VLESS request");
     }
-}
+  });
+
+  ws.on("close", cleanup);
+
+  ws.on("error", (error) => {
+    console.error("WebSocket error:", error.message);
+    cleanup();
+  });
+});
+
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Adam listening on port ${PORT}`);
+});
