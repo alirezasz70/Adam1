@@ -1,56 +1,40 @@
-export const NODES = [
-  // ================= نودهای رایگان فعلی =================
-  {
-    id: "free-deno-1",
-    name: "🇩🇪 Free - Deno Edge",
-    type: "vless",
-    server: "edgetunnel.a.rsadeghzadeh91.workers.dev", // دامنه نود دنو که بعداً می‌سازی
-    uuid: process.env.MY_UUID, 
-    tls: true,
-    sni: "edgetunnel.a.rsadeghzadeh91.workers.dev",
-    network: "ws",
-    
-    // تکنیک اختفای وب‌سایت (پث مخفی)
-    path: "/proxy-vless", 
-    
-    // آرایه پورت‌ها
-    ports: [443, 8443, 2053, 2083], 
-    
-    // آرایه آی‌پی‌های تمیز
-    cleanIPs: [
-      { ip: "104.16.0.1", name: "IR-Telecom" },
-      { ip: "141.101.64.10", name: "IR-Mokhaberat" }
-    ],
+function required(name) {
+  const value = process.env[name]?.trim();
 
-    // تنظیمات فرگمنت مخصوص این نود
-    fragment: { enabled: true, packets: "tlshello", length: "100-200", interval: "10-20" },
-    
-    isActive: true
-  },
-
-  // ================= نودهای آینده (سرور شخصی) =================
-  /*
-  {
-    id: "vps-reality-1",
-    name: "🇫🇮 VIP - Hetzner Reality",
-    type: "vless-reality",
-    server: "195.x.x.x", // آی‌پی سرور آینده
-    port: 443,
-    uuid: process.env.MY_UUID,
-    flow: "xtls-rprx-vision",
-    sni: "www.microsoft.com",
-    publicKey: "xxxxxx",
-    shortId: "xxxx",
-    
-    // اگر آی‌پی فیلتر شد، تونل رو فعال کن
-    tunnel: {
-      enabled: true,
-      type: "argo", 
-      relayServer: "clean-relay-domain.com",
-      relayPort: 443
-    },
-    
-    isActive: false // وقتی سرور خریدی این رو true کن
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
   }
-  */
+
+  return value;
+}
+
+function validPort(name, fallback) {
+  const value = Number(process.env[name] || fallback);
+
+  if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    throw new Error(`Invalid port in ${name}`);
+  }
+
+  return value;
+}
+
+const uuid = required("VLESS_UUID");
+
+export const NODES = [
+  {
+    id: "primary",
+    name: process.env.NODE_NAME || "My first node",
+    type: "vless-ws",
+    active: process.env.NODE_ACTIVE !== "false",
+
+    // دامنه‌ای که واقعاً به سرور WebSocket وصل شده باشد؛
+    // این مقدار را با workers.dev یا IP تصادفی جایگزین نکن.
+    server: required("PUBLIC_HOST"),
+    port: validPort("PUBLIC_PORT", 443),
+
+    uuid,
+    tls: process.env.PUBLIC_TLS !== "false",
+    sni: process.env.PUBLIC_SNI || required("PUBLIC_HOST"),
+    path: process.env.VLESS_PATH || "/proxy-vless",
+  },
 ];
