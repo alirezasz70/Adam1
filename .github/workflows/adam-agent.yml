@@ -1,0 +1,55 @@
+
+name: Adam Agent
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test Adam
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v4
+        with:
+          ref: adam-agent-setup
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          else
+            echo "No package.json found"
+          fi
+
+      - name: Run tests
+        run: |
+          if [ -f package.json ]; then
+            npm test --if-present
+          else
+            echo "Tests skipped: package.json not found"
+          fi
+
+      - name: Save test report
+        if: always()
+        run: |
+          echo "Adam Agent test run completed." > adam-report.txt
+          echo "Branch: adam-agent-setup" >> adam-report.txt
+          echo "See workflow logs for test results." >> adam-report.txt
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adam-test-report
+          path: adam-report.txt
